@@ -375,6 +375,142 @@ DesignedCapacity       38.896 Ah    vs  nameplate        38.9 Ah
 Note **TotalCapacity 36.570 Ah** against **DesignedCapacity 38.896 Ah** — the pack
 has lost 2.3 Ah, consistent with the reported 94 % SoH.
 
+
+### 3.5 The command layer is not read-only
+
+The `0x46`/`0x47` of §3.2 is one operation of several. The full set, recovered from the
+vendor application's `ProtocolModel` enum and confirmed on hardware:
+
+| Operation | Meaning |
+|---|---|
+| `RamRead` | the register read of §3.2–3.3 |
+| `RamWrite` | write MCU RAM |
+| `IicRead` | read an on-board I2C device (§3.5.1) |
+| `IicWrite` | write an on-board I2C device |
+| `FlashWrite` | write the parameter flash |
+
+There is **no `FlashRead`** and no bootloader read/verify verb — the MCU code flash cannot be
+read back over Bluetooth (§3.8). Note this revises the earlier "no write command" reading
+(Provenance): writes exist, they simply never occur in normal traffic.
+
+### 3.5.1 I2C sub-protocol (`0x77` / `0x78`)
+
+`IicRead` reaches devices on the MCU's internal I2C bus with a two-frame exchange:
+
+```
+setup : 46 16 00 77 <addrBytes+3> <addrBytes> <iicAddr|1> <reg : addrBytes bytes, LE> <count> <cksum>
+fetch : 46 16 01 78 <count> <cksum>
+```
+
+`cksum = sum(preceding) & 0xFF`; the `0x47` response to the fetch carries `count` bytes.
+
+| Target | I2C addr | addr width | Holds |
+|---|---|---|---|
+| parameter flash | `0x5A` | 4 bytes | configuration / protection store (§3.6) |
+| EEPROM | `0xA0` | 2 bytes | event-record log (§3.7) |
+| gauge (`BQ7541`) | `0xAA` | — | fuel-gauge variant — **not populated** on this pack (constant stub) |
+
+> ⚠️ The MCU does not forward arbitrary I2C addresses to a live bus. An address sweep aliases
+> to three internal buffers — `0x10–0x9E` → the parameter flash, `0xA0` → the EEPROM,
+> `0xA2–0xEE` → a 16-byte status buffer. The apparent abundance of diagnostic ports is address
+> aliasing, not additional data.
+
+The analog front-end is a **TI BQ769x0** (BQ76930 / 76940 / 76925, selected in the config) — a
+register device with no firmware.
+
+### 3.6 Configuration / protection store (`0x5A`)
+
+1 KiB, read as 32 x 32-byte `IicRead`s at registers `0, 32, … 992`. The blob is obfuscated with
+a **TEA-family 64-bit block cipher, ECB, little-endian** (constant regions produce repeating
+8-byte ciphertext — the tell). The key is a plaintext constant in the vendor Android app:
+
+```python
+key = [164289094, 3213027235, 1948917127, 3141931453]   # four u32 words
+# rounds = 32, sum0 = 0xC6EF3720, delta = 0x9E3779B9
+
+def deobfuscate(blob):                     # read-only; recovers the layout below
+    M = 0xFFFFFFFF; out = bytearray(blob); a, b, c, d = key
+    for i in range(0, len(out), 8):
+        y = int.from_bytes(out[i:i+4], 'little'); z = int.from_bytes(out[i+4:i+8], 'little')
+        s = 0xC6EF3720
+        for _ in range(32):
+            z = (z - ((((y<<4 & 0xFFFFFFF0)+c & M) ^ (y+s & M)) ^ (((y>>5 & 0x07FFFFFF)+d) & M))) & M
+            y = (y - ((((z<<4 & 0xFFFFFFF0)+a & M) ^ (z+s & M)) ^ (((z>>5 & 0x07FFFFFF)+b) & M))) & M
+            s = (s - 0x9E3779B9) & M
+        out[i:i+4] = y.to_bytes(4,'little'); out[i+4:i+8] = z.to_bytes(4,'little')
+    return bytes(out)
+```
+
+Deobfuscated layout (offsets, confirmed on this pack):
+
+| Offset | Field | Encoding / value |
+|---|---|---|
+| 0 | full-charge capacity | u16 mAh — 38896 |
+| 4 | design capacity | u16 mAh — 60000 |
+| 8 | auto-off | u16 min |
+| 11 | hardware version | nibble.nibble — 3.0 |
+| 16–18 | manufacture date | Y-M-D — 2023-06-19 |
+| 32/48/64/96 | ASCII | manufacturer / cell / part / barcode |
+| 208–210 | cell over-voltage | u16 mV — 4250 (release 4150) |
+| 213–216 | cell under-voltage | u16 mV — 2700 (release 3200) |
+| 217 & 0x3F | series count | 16 |
+| 218 & 7 | protection chip | 0→BQ76930, else BQ76940 / 76925 |
+| 221 | over-current release | s — 50 |
+| 222–224 | over-temperature CHG/DSG | °C = (nibble·2)+40 — 60 / 70 (rel 56 / 66) |
+| 225–227 | under-temperature CHG/DSG | °C = 10−(nibble·2) — 0 / −20 |
+| 228–229 | charge-balance voltage | u16 mV — 3900 |
+| 232 | charge-current protect | byte·100 mA — 15000 |
+| 235 | primary over-discharge | signed A |
+| 238–239 | shunt resistor | u16 µΩ — 509 |
+| 304+ | per-cell calibration | 16 x s8 |
+| 512–713 | OCV↔SoC curve | 101 x u16 mV, 100 %→0 % (4194 → 3001) |
+
+Reads past 1 KiB alias back into the store; it is exactly 1 KiB over this interface.
+
+### 3.7 Event-record log (`0xA0`)
+
+`IicRead`, 2-byte addressing, **plaintext**. A header/counter block sits low; a ring buffer of
+**64-byte event records** begins at `0x2C0`:
+
+```
+[YY MM DD HH MM SS] · state / current / 4x temp · 16 x u16 LE cell mV
+```
+
+Fault/warning conditions (ROM error, fuse burned, over-current tiers, cell-drop/imbalance, RTC,
+temperature) are bit-mapped in the record state bytes — the working fault detail the live
+`BmsStatus` register (§3.3) does not provide.
+
+### 3.8 Write path and firmware update — unauthenticated
+
+The same unpaired `fff1` pipe carries `RamWrite` / `IicWrite` / `FlashWrite` and a firmware
+update. Firmware images are **Intel-HEX**, streamed record-by-record to `fff1` (ACK-paced)
+after the MCU is placed in a bootloader state; erase precedes the stream. The `f000ffc0`
+service (§3.1) is a cloned TI-OAD service and is **not** the update path.
+
+Security posture, plainly:
+
+* Anyone in Bluetooth range can not only read the pack but **write the protection configuration
+  of §3.6** — cell OV/UV, current and temperature limits, capacity — with **no authentication**.
+* The MCU code flash is write-only over this link (no `FlashRead`/verify); the running firmware
+  cannot be dumped via Bluetooth.
+
+> The exact write / erase / flash frames are intentionally **not** reproduced here: a malformed
+> or malicious write to a live lithium pack can disable its protections. This section documents
+> that the path exists and its security posture, not how to drive it.
+
+### 3.9 Additional registers
+
+Beyond §3.3, on this pack:
+
+| ID | Field | Notes |
+|---|---|---|
+| 0 | run-state + temps | byte 0 `0x46` = application running (≠ ⇒ bootloader) |
+| 26 | firmware/hardware tag + `idx` | version = `b1 + b0/100`; `idx` = ASCII bytes 4–7 (`UA25`) — the key the update server files firmware under |
+| 38 | charge/discharge accumulators | s32 / u32 |
+| 120 | newest event timestamp | mirrors the latest §3.7 record |
+| 160 | status / counter | mirrors register 22 |
+
+
 ---
 
 ## 4. Practical notes
@@ -426,11 +562,17 @@ def request(param, length):
 
 ## Provenance
 
-This document was produced by **clean-room reverse engineering**: every value was
-derived from direct observation of privately-owned hardware — CAN captures,
-Bluetooth GATT exchanges, and multimeter measurements. No vendor firmware was
-decompiled, no proprietary documentation was consulted, and no confidential
-material was used.
+Sections 1–3.4 (the CAN link, the harness, and the Bluetooth **telemetry read** path)
+were produced by **clean-room reverse engineering**: every value derived from direct
+observation of privately-owned hardware — CAN captures, Bluetooth GATT exchanges, and
+multimeter measurements — cross-referenced against the public prior art below.
+
+Sections 3.5–3.9 (the I2C sub-protocol, the configuration/parameter store and its
+obfuscation, the event-record log, and the write/firmware-update path) were additionally
+derived by reverse-engineering the vendor's **publicly distributed Android application**
+(jadx decompilation of the free app), and every decoded value was then confirmed by reading
+the live pack. That application is a public download — not firmware, not confidential, and
+not vendor documentation.
 
 ### Prior art used
 
@@ -446,8 +588,10 @@ was cross-referenced against:
 That project provided the protocol framing, the parameter map, and six real
 traffic captures which were used here to validate a parser (3189 frames, 3156
 checksum passes; the 33 failures are capture noise, not protocol). It also
-supplied the decisive negative result that the vendor's protocol contains **no
-write command** — 3156 packets from a working bike, every one a read.
+supplied the decisive negative result that **no write command appears in normal
+traffic** — 3156 packets from a working bike, every one a read. (The app decompilation in
+§3.5/§3.8 later showed the protocol *defines* write operations; they simply never occur in
+ordinary use.)
 
 Recognising that this pack's **Bluetooth dongle speaks that same serial protocol**
 is what turned an opaque BLE characteristic into a fully-decoded parameter map in
